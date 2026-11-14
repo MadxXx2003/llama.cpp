@@ -679,7 +679,7 @@ index 1a9cf55cb915..ead188cac347 100644
      }
  
      const int64_t s01 = src0->nb[1] / ts_src0;
-@@ -1579,6 +1617,16 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1579,6 +1618,16 @@ void ggml_cuda_mul_mat_vec_q(
  
      const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
  
