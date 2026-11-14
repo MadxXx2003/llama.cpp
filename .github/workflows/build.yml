@@ -1,0 +1,88 @@
+name: Build Windows CUDA DLLs and Binaries
+
+on:
+  push:
+    branches: [ "*" ]
+  workflow_dispatch:
+
+jobs:
+  build-windows-cuda-shared:
+    runs-on: windows-2022 # Pin explicitly to windows-2022 to guarantee Visual Studio 2022 availability
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure Git Identity & Apply Patches Safely
+        shell: bash
+        run: |
+          git config user.name "GitHub Action Runner"
+          git config user.email "runner@actions.local"
+
+          echo "Checking for patch files..."
+          shopt -s nullglob nocaseglob
+          patches=(Patches/*.patch patch/*.patch)
+          if [ ${#patches[@]} -gt 0 ]; then
+            for p in "${patches[@]}"; do
+              if [ -f "$p" ]; then
+                echo "Trying to apply patch: $p"
+                if git apply --3way "$p" 2>/dev/null || git apply --ignore-space-change --ignore-whitespace "$p" 2>/dev/null || git am "$p" 2>/dev/null; then
+                  echo "Successfully applied: $p"
+                elif git apply --reverse --check "$p" 2>/dev/null; then
+                  echo "NOTICE: Patch $p appears to be already applied. Skipping."
+                else
+                  echo "WARNING: Patch $p failed to apply cleanly. Skipping this patch and continuing build."
+                fi
+              fi
+            done
+            echo "All patch processing completed."
+          else
+            echo "No patch files found in Patches/ or patch/ directory."
+          fi
+          shopt -u nullglob nocaseglob
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.16
+        with:
+          cuda: '12.4.0'
+
+      - name: Initialize MSVC Developer Command Prompt
+        uses: ilammy/msvc-dev-cmd@v1 # Sets up required environment variables and compiler paths for MSVC
+
+      - name: Configure CMake for Windows CUDA Shared Libraries
+        shell: pwsh
+        run: |
+          mkdir build
+          cd build
+          
+          # CMake will now automatically detect MSVC and the CUDA toolkit via environment variables
+          cmake .. `
+            -DGGML_CUDA=ON `
+            -DGGML_NATIVE=OFF `
+            -DGGML_BACKEND_DL=ON `
+            -DGGML_CPU_ALL_VARIANTS=ON `
+            -DGGML_AVX512=OFF `
+            -DGGML_AVX512_VBMI=OFF `
+            -DGGML_AVX512_VNNI=OFF `
+            -DGGML_AVX512_BF16=OFF `
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build Everything
+        shell: pwsh
+        run: |
+          cmake --build build --config Release --parallel
+
+      - name: Bundle DLLs, EXEs, and NVIDIA Runtimes
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path final-release
+          Get-ChildItem -Path build -Recurse -Filter "*.exe" | Copy-Item -Destination final-release -Force
+          Get-ChildItem -Path build -Recurse -Filter "*.dll" | Copy-Item -Destination final-release -Force
+
+      - name: Upload Windows Package Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-windows-cuda-shared-dlls
+          path: final-release/*
