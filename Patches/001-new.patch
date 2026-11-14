@@ -918,4 +918,3 @@ index d5ff93b91241..2ac4ab2e9626 100644
  static __device__ __forceinline__ float vec_dot_q4_0_q8_1(
      const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
  
-
