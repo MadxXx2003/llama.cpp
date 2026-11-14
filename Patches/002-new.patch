@@ -1,0 +1,674 @@
+From aa1ffbf2e0a4a38566a50898120ccc67880793d6 Mon Sep 17 00:00:00 2001
+From: LuzginDev <rostiknov@gmail.com>
+Date: Sun, 1 Nov 2026 20:41:57 +0100
+Subject: [PATCH 2/5] finaly TQ2_0 too is completed
+
+---
+ ggml/CMakeLists.txt                           |  1 +
+ ggml/src/ggml-common.h                        |  3 +
+ ggml/src/ggml-cuda/CMakeLists.txt             |  4 +
+ ggml/src/ggml-cuda/common.cuh                 | 53 ++++++++++
+ ggml/src/ggml-cuda/convert.cu                 | 12 +++
+ ggml/src/ggml-cuda/dequantize.cuh             | 15 +++
+ ggml/src/ggml-cuda/getrows.cu                 |  4 +
+ ggml/src/ggml-cuda/ggml-cuda.cu               |  2 +
+ ggml/src/ggml-cuda/mmq-config-ampere.cuh      | 17 ++++
+ ggml/src/ggml-cuda/mmq-config-pascal-dp4a.cuh | 12 +++
+ .../src/ggml-cuda/mmq-config-pascal-older.cuh | 12 +++
+ ggml/src/ggml-cuda/mmq-load-tiles.cuh         | 99 +++++++++++++++++++
+ ggml/src/ggml-cuda/mmq.cu                     |  4 +
+ ggml/src/ggml-cuda/mmq.cuh                    | 15 +++
+ ggml/src/ggml-cuda/mmvq.cu                    | 20 +++-
+ .../template-instances/generate_cu_files.py   |  1 +
+ ggml/src/ggml-cuda/vecdotq.cuh                | 82 +++++++++++++++
+ 17 files changed, 352 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/CMakeLists.txt b/ggml/CMakeLists.txt
+index 1224d0596c58..b9f27bd9cd87 100644
+--- a/ggml/CMakeLists.txt
++++ b/ggml/CMakeLists.txt
+@@ -202,6 +202,7 @@ option(GGML_MUSA                            "ggml: use MUSA"
+ option(GGML_CUDA_FORCE_MMQ                  "ggml: use mmq kernels instead of cuBLAS"         OFF)
+ option(GGML_CUDA_FORCE_CUBLAS               "ggml: always use cuBLAS instead of mmq kernels"  OFF)
+ option(GGML_CUDA_TQ1_0_NOMUL                "ggml: TQ1_0 CUDA kernels without integer multiply (slower)" OFF)
++option(GGML_CUDA_TQ2_0_NOMUL                "ggml: TQ2_0 CUDA kernels without integer multiply (slower)" OFF)
+ option(GGML_CUDA_NO_PEER_COPY               "ggml: do not use peer to peer copies"            OFF)
+ option(GGML_CUDA_NO_VMM                     "ggml: do not try to use CUDA VMM"                OFF)
+ option(GGML_CUDA_FA                         "ggml: compile ggml FlashAttention CUDA kernels"  ON)
+diff --git a/ggml/src/ggml-common.h b/ggml/src/ggml-common.h
+index baed3ba7e2e6..9dead3755c1d 100644
+--- a/ggml/src/ggml-common.h
++++ b/ggml/src/ggml-common.h
+@@ -102,6 +102,9 @@ typedef sycl::half2 ggml_half2;
+ #define QI_TQ1_0 (QK_K / 32)
+ #define QR_TQ1_0 1
+ 
++#define QI_TQ2_0 (QK_K / 32)
++#define QR_TQ2_0 1
++
+ #define QI4_0 (QK4_0 / (4 * QR4_0))
+ #define QR4_0 2
+ 
+diff --git a/ggml/src/ggml-cuda/CMakeLists.txt b/ggml/src/ggml-cuda/CMakeLists.txt
+index 069969e98bc7..c9ddba344c24 100644
+--- a/ggml/src/ggml-cuda/CMakeLists.txt
++++ b/ggml/src/ggml-cuda/CMakeLists.txt
+@@ -148,6 +148,10 @@ if (CUDAToolkit_FOUND)
+         add_compile_definitions(GGML_CUDA_TQ1_0_NOMUL)
+     endif()
+ 
++    if (GGML_CUDA_TQ2_0_NOMUL)
++        add_compile_definitions(GGML_CUDA_TQ2_0_NOMUL)
++    endif()
++
+     if (GGML_CUDA_NO_VMM)
+         add_compile_definitions(GGML_CUDA_NO_VMM)
+     endif()
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 82082c4e309d..7931f936217f 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1118,6 +1118,59 @@ static __device__ __forceinline__ int ggml_cuda_tq1_0_pow3(const int n) {
+     return (n > 1) ? ((n > 2) ? ((n > 3) ? 81 : 27) : 9) : ((n > 0) ? 3 : 1);
+ }
+ 
++template<>
++struct ggml_cuda_type_traits<GGML_TYPE_TQ2_0> {
++    static constexpr int qk = QK_K;
++    static constexpr int qr = QR_TQ2_0;
++    static constexpr int qi = QI_TQ2_0; // 8 chunks of 32 elements per block
++    static constexpr int bs = sizeof(block_tq2_0);
++};
++
++// TQ2_0: QK_K = 256 weights per block, 2 bits each, ONE fp16 scale.
++// block_tq2_0 = uint8_t qs[64] + ggml_half d = 66 bytes.
++//
++// The element -> (byte, bit pair) map below is the one both CPU codecs agree on:
++// dequantize_row_tq2_0 (ggml-quants.c) walks j = 0,32 / l = 0..3 / m = 0..31 and reads
++// qs[j + m] at shift 2*l, and ggml_vec_dot_tq2_0_q8_K_generic (ggml-cpu/quants.c) walks the very
++// same nest. Writing e = 128*c + 32*l + m with c in {0,1}, l = 0..3, m = 0..31:
++//     byte = qs[32*c + m],  digit = (byte >> 2*l) & 3,  weight = digit - 1
++// So each 32-byte half of qs carries one value of c, and inside a half the 32 consecutive bytes
++// are the 32 consecutive m of ONE bit-pair position l. Compared with TQ1_0 that removes every
++// split/transpose case: a 32-element chunk of a row is 32 contiguous bytes at one single shift,
++// and a MMQ tile row is filled by 16 threads that each own 16 contiguous bytes at one shift.
++//
++// All four levels stay exact. quantize_row_tq2_0_ref rounds |x/d| <= 1 into {-1, 0, 1} and then
++// masks with & 3, so a freshly quantized tensor never holds a 3; a requantized or hand-built one
++// can, and there the weight is +2. Every kernel below works on digit - 1 rather than on a ternary
++// assumption, so a digit of 3 comes out as +2 exactly like the CPU does.
++static __device__ __forceinline__ int ggml_cuda_tq2_0_digit(const block_tq2_0 * x, const int e) {
++    const int c = e >> 7;          // which 32-byte half of qs
++    const int l = (e >> 5) & 3;    // bit pair inside the byte
++    const int m = e & 31;          // byte inside the half
++    return (x->qs[32*c + m] >> (2*l)) & 3;
++}
++
++// Weight of element e (0..255) of the block, in {-1, 0, +1, +2}. The only multiply left is the one
++// by the block scale, which the caller applies once per block.
++static __device__ __forceinline__ int ggml_cuda_tq2_0_symbol(const block_tq2_0 * x, const int e) {
++    return ggml_cuda_tq2_0_digit(x, e) - 1;
++}
++
++// Raw digits 0..3 of the four bytes of one weight word, as four int8 bytes in one word. shift is
++// 2*l with l = 0..3: the bits the shift drags in from the neighbouring byte are exactly the ones
++// the mask drops, so this is correct for every l, including the top byte of the word (zeros shift
++// in there). Two integer ops for four weights.
++static __device__ __forceinline__ int ggml_cuda_tq2_0_digits4(const int w4, const int shift) {
++    return (w4 >> shift) & 0x03030303;
++}
++
++// Same, biased to the weights digit - 1 ({-1, 0, +1, +2} as int8 bytes). Same shape as the q4_0
++// MMQ tile loader (__vsub4((qs >> 0) & 0x0F0F0F0F, 0x08080808)), so no new idiom: __vsub4 is a
++// per-byte subtract with wrap-around, digits are 0..3, and no lane can borrow from its neighbour.
++static __device__ __forceinline__ int ggml_cuda_tq2_0_symbols4(const int w4, const int shift) {
++    return __vsub4(ggml_cuda_tq2_0_digits4(w4, shift), 0x01010101);
++}
++
+ template<>
+ struct ggml_cuda_type_traits<GGML_TYPE_Q4_0> {
+     static constexpr int qk = QK4_0;
+diff --git a/ggml/src/ggml-cuda/convert.cu b/ggml/src/ggml-cuda/convert.cu
+index 4d5b0596fb06..ea8deed7474b 100644
+--- a/ggml/src/ggml-cuda/convert.cu
++++ b/ggml/src/ggml-cuda/convert.cu
+@@ -501,6 +501,8 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
+             return dequantize_block_cont_cuda<QK2_0, QR2_0, dequantize_q2_0>;
+         case GGML_TYPE_TQ1_0:
+             return dequantize_block_cont_cuda<QK_K, QR_TQ1_0, dequantize_tq1_0>;
++        case GGML_TYPE_TQ2_0:
++            return dequantize_block_cont_cuda<QK_K, QR_TQ2_0, dequantize_tq2_0>;
+         case GGML_TYPE_Q4_0:
+             return dequantize_row_q4_0_cuda;
+         case GGML_TYPE_Q4_1:
+@@ -560,6 +562,8 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
+             return dequantize_block_cont_cuda<QK2_0, QR2_0, dequantize_q2_0>;
+         case GGML_TYPE_TQ1_0:
+             return dequantize_block_cont_cuda<QK_K, QR_TQ1_0, dequantize_tq1_0>;
++        case GGML_TYPE_TQ2_0:
++            return dequantize_block_cont_cuda<QK_K, QR_TQ2_0, dequantize_tq2_0>;
+         case GGML_TYPE_Q4_0:
+             return dequantize_row_q4_0_cuda;
+         case GGML_TYPE_Q4_1:
+@@ -622,6 +626,8 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
+             return dequantize_block_cont_cuda<QK2_0, QR2_0, dequantize_q2_0>;
+         case GGML_TYPE_TQ1_0:
+             return dequantize_block_cont_cuda<QK_K, QR_TQ1_0, dequantize_tq1_0>;
++        case GGML_TYPE_TQ2_0:
++            return dequantize_block_cont_cuda<QK_K, QR_TQ2_0, dequantize_tq2_0>;
+         case GGML_TYPE_Q4_0:
+             return dequantize_row_q4_0_cuda;
+         case GGML_TYPE_Q4_1:
+@@ -683,6 +689,8 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
+             return dequantize_block_cuda<QK2_0, QR2_0, dequantize_q2_0>;
+         case GGML_TYPE_TQ1_0:
+             return dequantize_block_cuda<QK_K, QR_TQ1_0, dequantize_tq1_0>;
++        case GGML_TYPE_TQ2_0:
++            return dequantize_block_cuda<QK_K, QR_TQ2_0, dequantize_tq2_0>;
+         case GGML_TYPE_Q4_0:
+             return dequantize_block_cuda<QK4_0, QR4_0, dequantize_q4_0>;
+         case GGML_TYPE_Q4_1:
+@@ -710,6 +718,8 @@ to_bf16_nc_cuda_t ggml_get_to_bf16_nc_cuda(ggml_type type) {
+             return dequantize_block_cuda<QK2_0, QR2_0, dequantize_q2_0>;
+         case GGML_TYPE_TQ1_0:
+             return dequantize_block_cuda<QK_K, QR_TQ1_0, dequantize_tq1_0>;
++        case GGML_TYPE_TQ2_0:
++            return dequantize_block_cuda<QK_K, QR_TQ2_0, dequantize_tq2_0>;
+         case GGML_TYPE_Q4_0:
+             return dequantize_block_cuda<QK4_0, QR4_0, dequantize_q4_0>;
+         case GGML_TYPE_Q4_1:
+@@ -737,6 +747,8 @@ to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type) {
+             return dequantize_block_cuda<QK2_0, QR2_0, dequantize_q2_0>;
+         case GGML_TYPE_TQ1_0:
+             return dequantize_block_cuda<QK_K, QR_TQ1_0, dequantize_tq1_0>;
++        case GGML_TYPE_TQ2_0:
++            return dequantize_block_cuda<QK_K, QR_TQ2_0, dequantize_tq2_0>;
+         case GGML_TYPE_Q4_0:
+             return dequantize_block_cuda<QK4_0, QR4_0, dequantize_q4_0>;
+         case GGML_TYPE_Q4_1:
+diff --git a/ggml/src/ggml-cuda/dequantize.cuh b/ggml/src/ggml-cuda/dequantize.cuh
+index 584b348c3e40..6110f199aa04 100644
+--- a/ggml/src/ggml-cuda/dequantize.cuh
++++ b/ggml/src/ggml-cuda/dequantize.cuh
+@@ -60,6 +60,21 @@ static __device__ __forceinline__ void dequantize_tq1_0(const void * vx, const i
+     v.y = ggml_cuda_tq1_0_symbol(x + ib, iqs + 1) * d;
+ }
+ 
++// tq2_0: 2 bits per element, QK_K = 256 elements per block, ONE fp16 scale. The layout and the
++// digit extraction live in ggml_cuda_tq2_0_digit (common.cuh); the only multiply here is by the
++// block scale.
++//
++// Same qr == 1 contract as dequantize_tq1_0: iqs = (i00 % qk)/qr IS the element index (i00 is even)
++// and the caller stores v.x into element iqs and v.y into element iqs + 1.
++static __device__ __forceinline__ void dequantize_tq2_0(const void * vx, const int64_t ib, const int iqs, float2 & v) {
++    const block_tq2_0 * x = (const block_tq2_0 *) vx;
++
++    const float d = x[ib].d;
++
++    v.x = ggml_cuda_tq2_0_symbol(x + ib, iqs + 0) * d;
++    v.y = ggml_cuda_tq2_0_symbol(x + ib, iqs + 1) * d;
++}
++
+ static __device__ __forceinline__ void dequantize_q4_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
+     const block_q4_0 * x = (const block_q4_0 *) vx;
+ 
+diff --git a/ggml/src/ggml-cuda/getrows.cu b/ggml/src/ggml-cuda/getrows.cu
+index 0de902a6ea66..a7eac73f6bda 100644
+--- a/ggml/src/ggml-cuda/getrows.cu
++++ b/ggml/src/ggml-cuda/getrows.cu
+@@ -328,6 +328,10 @@ static void ggml_cuda_get_rows_switch_src0_type(
+             get_rows_cuda_q<QK_K, QR_TQ1_0, dequantize_tq1_0>(src0_d, src1_d, dst_d,
+                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+             break;
++        case GGML_TYPE_TQ2_0:
++            get_rows_cuda_q<QK_K, QR_TQ2_0, dequantize_tq2_0>(src0_d, src1_d, dst_d,
++                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
++            break;
+         case GGML_TYPE_Q4_0:
+             get_rows_cuda_q<QK4_0, QR4_0, dequantize_q4_0>(src0_d, src1_d, dst_d,
+                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index db816bbd9a31..30a923e6b1a7 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5842,6 +5842,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+                     case GGML_TYPE_Q1_0:
+                     case GGML_TYPE_Q2_0:
+                     case GGML_TYPE_TQ1_0:
++                    case GGML_TYPE_TQ2_0:
+                     case GGML_TYPE_Q4_0:
+                     case GGML_TYPE_Q4_1:
+                     case GGML_TYPE_Q5_0:
+@@ -5903,6 +5904,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+                     case GGML_TYPE_IQ4_NL:
+                     case GGML_TYPE_MXFP4:
+                     case GGML_TYPE_TQ1_0:
++                    case GGML_TYPE_TQ2_0:
+                         // 32-value sub-blocks, the row size does not guarantee
+                         // the QK_K super-blocks the get_rows kernel iterates on
+                         return op->src[0]->ne[0] % QK_K == 0;
+diff --git a/ggml/src/ggml-cuda/mmq-config-ampere.cuh b/ggml/src/ggml-cuda/mmq-config-ampere.cuh
+index 9912407e42f5..de85f099db4c 100644
+--- a/ggml/src/ggml-cuda/mmq-config-ampere.cuh
++++ b/ggml/src/ggml-cuda/mmq-config-ampere.cuh
+@@ -50,6 +50,23 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
+     CASE(GGML_TYPE_TQ1_0, 256, 1, 128, 112, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, false);
+     CASE(GGML_TYPE_TQ1_0, 256, 1, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, false);
+ 
++    CASE(GGML_TYPE_TQ2_0, 256, 1, 128,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, true);
++    CASE(GGML_TYPE_TQ2_0, 256, 1, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, true);
++    CASE(GGML_TYPE_TQ2_0, 256, 1, 128,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, true);
++    CASE(GGML_TYPE_TQ2_0, 256, 1, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, true);
++    CASE(GGML_TYPE_TQ2_0, 256, 1, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, true);
++    CASE(GGML_TYPE_TQ2_0, 256, 1, 128,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, false);
++    CASE(GGML_TYPE_TQ2_0, 256, 1, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, false);
++    CASE(GGML_TYPE_TQ2_0, 256, 1, 128,  24, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, false);
++    CASE(GGML_TYPE_TQ2_0, 256, 1, 128,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, false);
++    CASE(GGML_TYPE_TQ2_0, 256, 1, 128,  40, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, false);
++    CASE(GGML_TYPE_TQ2_0, 256, 1, 128,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, false);
++    CASE(GGML_TYPE_TQ2_0, 256, 1, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, false);
++    CASE(GGML_TYPE_TQ2_0, 256, 1, 128,  80, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, false);
++    CASE(GGML_TYPE_TQ2_0, 256, 1, 128,  96, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, false);
++    CASE(GGML_TYPE_TQ2_0, 256, 1, 128, 112, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, false);
++    CASE(GGML_TYPE_TQ2_0, 256, 1, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, false);
++
+     CASE(GGML_TYPE_Q4_0, 256, 1, 128,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, true);
+     CASE(GGML_TYPE_Q4_0, 256, 1, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, true);
+     CASE(GGML_TYPE_Q4_0, 256, 1, 128,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, true);
+diff --git a/ggml/src/ggml-cuda/mmq-config-pascal-dp4a.cuh b/ggml/src/ggml-cuda/mmq-config-pascal-dp4a.cuh
+index e075e1d23937..28a58f2713ad 100644
+--- a/ggml/src/ggml-cuda/mmq-config-pascal-dp4a.cuh
++++ b/ggml/src/ggml-cuda/mmq-config-pascal-dp4a.cuh
+@@ -35,6 +35,18 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
+     CASE(GGML_TYPE_TQ1_0, 256, 2, 64,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_TQ1_0, 256, 2, 64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+ 
++    CASE(GGML_TYPE_TQ2_0, 256, 2, 64,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_TQ2_0, 256, 2, 64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_TQ2_0, 256, 2, 64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_TQ2_0, 256, 2, 64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_TQ2_0, 256, 2, 64,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_TQ2_0, 256, 2, 64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_TQ2_0, 256, 2, 64,  24, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_TQ2_0, 256, 2, 64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_TQ2_0, 256, 2, 64,  40, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_TQ2_0, 256, 2, 64,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_TQ2_0, 256, 2, 64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++
+     CASE(GGML_TYPE_Q4_0, 256, 2, 64,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_Q4_0, 256, 2, 64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_Q4_0, 256, 2, 64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
+diff --git a/ggml/src/ggml-cuda/mmq-config-pascal-older.cuh b/ggml/src/ggml-cuda/mmq-config-pascal-older.cuh
+index 1d6061da4f5b..a04ea09d3685 100644
+--- a/ggml/src/ggml-cuda/mmq-config-pascal-older.cuh
++++ b/ggml/src/ggml-cuda/mmq-config-pascal-older.cuh
+@@ -35,6 +35,18 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
+     CASE(GGML_TYPE_TQ1_0, 256, 2, 64,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_TQ1_0, 256, 2, 64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+ 
++    CASE(GGML_TYPE_TQ2_0, 256, 2, 64,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_TQ2_0, 256, 2, 64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_TQ2_0, 256, 2, 64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_TQ2_0, 256, 2, 64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_TQ2_0, 256, 2, 64,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_TQ2_0, 256, 2, 64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_TQ2_0, 256, 2, 64,  24, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_TQ2_0, 256, 2, 64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_TQ2_0, 256, 2, 64,  40, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_TQ2_0, 256, 2, 64,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_TQ2_0, 256, 2, 64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++
+     CASE(GGML_TYPE_Q4_0, 256, 2, 64,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_Q4_0, 256, 2, 64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_Q4_0, 256, 2, 64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
+diff --git a/ggml/src/ggml-cuda/mmq-load-tiles.cuh b/ggml/src/ggml-cuda/mmq-load-tiles.cuh
+index 226579fccfa8..39aebd9dbe45 100644
+--- a/ggml/src/ggml-cuda/mmq-load-tiles.cuh
++++ b/ggml/src/ggml-cuda/mmq-load-tiles.cuh
+@@ -1946,3 +1946,102 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+ #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+     }
+ }
++
++// TQ2_0: 2 bits per weight, QK_K = 256 = MMQ_ITER_K, so exactly one block is expanded per tile
++// row per iteration into signed bytes in a GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0 row. The stock q8_0
++// vec_dot (dp4a or mma) then does all the arithmetic and the only type specific code is this
++// loader, exactly like ggml_cuda_mmq_load_tiles_tq1_0 above.
++//
++// Element -> (byte, bit pair) inside a block (see ggml_cuda_tq2_0_digit in common.cuh), with
++// e = 128*c + 32*l + m:  byte = qs[32*c + m],  digit = (byte >> 2*l) & 3,  weight = digit - 1.
++// Sixteen threads per block, thread k owns elements [16k, 16k+16), i.e. 4 ints of the tile row.
++// For those 16 elements both c = k/8 and l = (k/2)%4 are CONSTANT and m runs over 16 consecutive
++// values, so thread k reads the 16 contiguous bytes
++//     qs[32*(k/8) + 16*(k%2) .. +15]
++// at the single shift 2*((k/2)%4): one shift, one mask and one __vsub4 per output int, and the
++// four output ints of one thread are four consecutive words of those 16 bytes. The mapping is a
++// bijection onto 0..255 (k = 0..7 covers c = 0, k = 8..15 covers c = 1, and inside a half the
++// pairs (l, m-half) are (0,lo) (0,hi) (1,lo) ... (3,hi) for k even/odd).
++//
++// Weight words are read with get_int_b2, never get_int_b4: block_tq2_0 is 66 bytes, so odd
++// numbered blocks are only 2-byte aligned and a 4-byte load would fault. The activations need no
++// change here, they are quantized to q8_1 by the regular y loader.
++template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_tq2_0(
++        const char * __restrict__ x, const char * __restrict__ x_gate, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
++    GGML_UNUSED(x_gate);
++
++    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
++    constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback, GGML_PREC_Q8) / warp_size;
++    constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback, GGML_PREC_Q8);
++
++#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
++    constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback, GGML_PREC_Q8);
++    int   * x_qs = (int   *)  x_tile;
++    float * x_df = (float *) (x_qs + 2*MMQ_TILE_NE_K);
++#else
++    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q8_0, I);
++    int   * x_qs = (int   *)  x_tile;
++    float * x_df = (float *) (x_qs + txs.qs);
++#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
++
++    constexpr int blocks_per_iter         = MMQ_ITER_K / QK_K;
++    constexpr int threads_per_block       = QK_K / 16;     // 16 weights (4 ints) each
++    constexpr int threads_per_row         = blocks_per_iter * threads_per_block;
++    constexpr int nrows                   = warp_size / threads_per_row;
++    constexpr int scale_entries_per_block = QK_K / QK8_1;  // 8: one scale per 32 elements
++    constexpr int scale_entries_per_row   = blocks_per_iter * scale_entries_per_block;
++
++    static_assert(threads_per_row <= warp_size, "TQ2_0 MMQ needs at least one row per warp");
++    static_assert(threads_per_block*(QI8_0/2) == 2*MMQ_TILE_NE_K, "TQ2_0 tile row must hold QK_K bytes");
++
++    const int txi        = threadIdx.x % threads_per_row;
++    const int kbx        = txi / threads_per_block;
++    const int kqsx       = txi % threads_per_block;
++    const int dst_offset = kbx*(scale_entries_per_block*QI8_0) + kqsx*(QI8_0/2);
++
++    const int shift = 2*((kqsx >> 1) & 3);             // bit pair position l of this thread
++    const int woff  = 8*(kqsx >> 3) + 4*(kqsx & 1);    // get_int_b2 word index of its 16 bytes
++
++#pragma unroll
++    for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
++        int i = i0 + threadIdx.y*nrows + threadIdx.x/threads_per_row;
++
++        if (fallback) {
++            i = min(i, i_max);
++        }
++
++        const block_tq2_0 * bxi = (const block_tq2_0 *) x + kbx0 + i*stride + kbx;
++
++#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
++        int * row = x_qs + i*sram_stride           + dst_offset;
++#else
++        int * row = x_qs + i*(2*MMQ_TILE_NE_K + 1) + dst_offset;
++#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
++
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            row[j] = ggml_cuda_tq2_0_symbols4(get_int_b2(bxi->qs, woff + j), shift);
++        }
++    }
++
++    // One fp16 scale per 256-element block, replicated over the 8 q8_1-sized entries of the row.
++    const int ksx         = threadIdx.x % scale_entries_per_row;
++    const int scale_block = ksx / scale_entries_per_block;   // always 0: one block per iteration
++
++#pragma unroll
++    for (int i0 = 0; i0 < I; i0 += nwarps) {
++        int i = i0 + threadIdx.y;
++
++        if (fallback) {
++            i = min(i, i_max);
++        }
++
++        const block_tq2_0 * bxi = (const block_tq2_0 *) x + kbx0 + i*stride + scale_block;
++
++#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
++        x_df[i*sram_stride                           + ksx] = bxi->d;
++#else
++        x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + ksx] = bxi->d;
++#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
++    }
++}
+diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+index 956c9ba93c1d..c1eaf5ab8e6c 100644
+--- a/ggml/src/ggml-cuda/mmq.cu
++++ b/ggml/src/ggml-cuda/mmq.cu
+@@ -31,6 +31,9 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
+         case GGML_TYPE_TQ1_0:
+             mul_mat_q_case<GGML_TYPE_TQ1_0, GGML_PREC_Q8>(ctx, args, stream);
+             break;
++        case GGML_TYPE_TQ2_0:
++            mul_mat_q_case<GGML_TYPE_TQ2_0, GGML_PREC_Q8>(ctx, args, stream);
++            break;
+ // -----------------------------------------------------------------------
+         case GGML_TYPE_Q2_K:
+             mul_mat_q_case<GGML_TYPE_Q2_K, GGML_PREC_Q8>(ctx, args, stream);
+@@ -418,6 +421,7 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
+             mmq_supported = true;
+             break;
+         case GGML_TYPE_TQ1_0:
++        case GGML_TYPE_TQ2_0:
+             // Ternary MMQ is wired up for NVIDIA only: the tile configs exist for
+             // pascal-older/pascal-dp4a/ampere (Pascal, Volta, Turing, Ampere, Ada, Hopper,
+             // Blackwell -- Blackwell falls back to the ampere config), but not for the AMD ones.
+diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
+index 36e42bde8c81..c43fe0193d71 100644
+--- a/ggml/src/ggml-cuda/mmq.cuh
++++ b/ggml/src/ggml-cuda/mmq.cuh
+@@ -65,6 +65,7 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
+         case GGML_TYPE_Q1_0:
+         case GGML_TYPE_Q2_0:
+         case GGML_TYPE_TQ1_0:   // ternary, expanded to signed bytes: one scale per 32 values
++        case GGML_TYPE_TQ2_0:   // 2-bit, expanded to signed bytes: one scale per 32 values
+             return MMQ_Q8_1_DS_LAYOUT_D4;
+         case GGML_TYPE_Q4_0:
+         case GGML_TYPE_Q4_1:
+@@ -401,6 +402,7 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
+         case GGML_TYPE_Q1_0:    return MMQ_DP4A_TXS_Q8_0;
+         case GGML_TYPE_Q2_0:    return MMQ_DP4A_TXS_Q8_0;
+         case GGML_TYPE_TQ1_0:   return MMQ_DP4A_TXS_Q8_0;  // trits expanded to bytes by the loader
++        case GGML_TYPE_TQ2_0:   return MMQ_DP4A_TXS_Q8_0;  // digits expanded to bytes by the loader
+         case GGML_TYPE_Q4_0:    return MMQ_DP4A_TXS_Q4_0;
+         case GGML_TYPE_Q4_1:    return MMQ_DP4A_TXS_Q4_1;
+         case GGML_TYPE_Q5_0:    return MMQ_DP4A_TXS_Q8_0;
+@@ -630,6 +632,12 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
+                     ggml_cuda_mmq_load_tiles_tq1_0<type, J, fallback>,
+                     ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a<type, J, fallback>,
+                     ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1>);
++            case GGML_TYPE_TQ2_0:
++                return ggml_cuda_mmq_util_funcs(
++                    VDR_TQ2_0_Q8_1_MMQ,
++                    ggml_cuda_mmq_load_tiles_tq2_0<type, J, fallback>,
++                    ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a<type, J, fallback>,
++                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1>);
+ // ---------------------------------------------------------------------------------------------
+             case GGML_TYPE_Q2_K:
+                 return ggml_cuda_mmq_util_funcs(
+@@ -806,6 +814,12 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
+                 ggml_cuda_mmq_load_tiles_tq1_0<type, J, fallback>,
+                 ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
+                 ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, false>);
++        case GGML_TYPE_TQ2_0:
++            return ggml_cuda_mmq_util_funcs(
++                -1,
++                ggml_cuda_mmq_load_tiles_tq2_0<type, J, fallback>,
++                ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
++                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, false>);
+ // ---------------------------------------------------------------------------------------------
+         case GGML_TYPE_Q2_K:
+             return ggml_cuda_mmq_util_funcs(
+@@ -1647,6 +1661,7 @@ extern DECL_MMQ_CASE(GGML_TYPE_Q5_0);
+ extern DECL_MMQ_CASE(GGML_TYPE_Q5_1);
+ extern DECL_MMQ_CASE(GGML_TYPE_Q8_0);
+ extern DECL_MMQ_CASE(GGML_TYPE_TQ1_0);
++extern DECL_MMQ_CASE(GGML_TYPE_TQ2_0);
+ // -----------------------------------------
+ extern DECL_MMQ_CASE(GGML_TYPE_Q2_K);
+ extern DECL_MMQ_CASE(GGML_TYPE_Q3_K);
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index ead188cac347..b84943996284 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -46,6 +46,11 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type)
+         case GGML_TYPE_TQ1_0:   return vec_dot_tq1_0_q8_1_nomul;
+ #else
+         case GGML_TYPE_TQ1_0:   return vec_dot_tq1_0_q8_1;
++#endif
++#ifdef GGML_CUDA_TQ2_0_NOMUL
++        case GGML_TYPE_TQ2_0:   return vec_dot_tq2_0_q8_1_nomul;
++#else
++        case GGML_TYPE_TQ2_0:   return vec_dot_tq2_0_q8_1;
+ #endif
+         case GGML_TYPE_Q4_0:    return vec_dot_q4_0_q8_1;
+         case GGML_TYPE_Q4_1:    return vec_dot_q4_1_q8_1;
+@@ -77,6 +82,7 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
+         case GGML_TYPE_Q1_0:    return VDR_Q1_0_Q8_1_MMVQ;
+         case GGML_TYPE_Q2_0:    return VDR_Q2_0_Q8_1_MMVQ;
+         case GGML_TYPE_TQ1_0:   return VDR_TQ1_0_Q8_1_MMVQ;
++        case GGML_TYPE_TQ2_0:   return VDR_TQ2_0_Q8_1_MMVQ;
+         case GGML_TYPE_Q4_0:    return VDR_Q4_0_Q8_1_MMVQ;
+         case GGML_TYPE_Q4_1:    return VDR_Q4_1_Q8_1_MMVQ;
+         case GGML_TYPE_Q5_0:    return VDR_Q5_0_Q8_1_MMVQ;
+@@ -290,13 +296,13 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
+ 
+ // Host function: returns the max batch size for the current arch+type at runtime.
+ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
+-    // TQ1_0 takes the arch default (MMVQ_MAX_BATCH_SIZE) like every other type that has a
+-    // mul_mat_vec_q kernel: the fused MUL_MAT_ID path is type-generic and only needs vec_dot
+-    // plus vdr, both of which TQ1_0 provides. Do NOT special-case it to -1: that forces every
++    // TQ1_0 and TQ2_0 take the arch default (MMVQ_MAX_BATCH_SIZE) like every other type that has
++    // a mul_mat_vec_q kernel: the fused MUL_MAT_ID path is type-generic and only needs vec_dot
++    // plus vdr, both of which they provide. Do NOT special-case them to -1: that forces every
+     // MoE layer into the ids-to-host + cudaStreamSynchronize fallback (host loop over all
+     // experts, one launch per active expert) and, because one such node is enough, disables
+     // CUDA graph capture for the whole graph.
+-    // Batches above MMVQ_MAX_BATCH_SIZE still fall back until an MMQ kernel for TQ1_0 exists.
++    // Batches above MMVQ_MAX_BATCH_SIZE go to the MMQ kernel (mmq-instance-tq1_0/tq2_0.cu).
+     // NVIDIA: P100, Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
+     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
+         cc = ggml_cuda_highest_compiled_arch(cc);
+@@ -1335,6 +1341,12 @@ static void mul_mat_vec_q_switch_type(
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+             break;
++        case GGML_TYPE_TQ2_0:
++            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_TQ2_0>
++                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
++                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
++                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
++            break;
+         case GGML_TYPE_Q2_0:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q2_0>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+diff --git a/ggml/src/ggml-cuda/template-instances/generate_cu_files.py b/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
+index 7be409bd36ab..eecb7d36b5b6 100755
+--- a/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
++++ b/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
+@@ -37,6 +37,7 @@
+ TYPES_MMQ = [
+     "GGML_TYPE_Q1_0",
+     "GGML_TYPE_Q2_0",
++    "GGML_TYPE_TQ1_0", "GGML_TYPE_TQ2_0",
+     "GGML_TYPE_Q4_0", "GGML_TYPE_Q4_1", "GGML_TYPE_Q5_0", "GGML_TYPE_Q5_1", "GGML_TYPE_Q8_0",
+     "GGML_TYPE_Q2_K", "GGML_TYPE_Q3_K", "GGML_TYPE_Q4_K", "GGML_TYPE_Q5_K", "GGML_TYPE_Q6_K",
+     "GGML_TYPE_IQ2_XXS", "GGML_TYPE_IQ2_XS", "GGML_TYPE_IQ2_S", "GGML_TYPE_IQ3_XXS", "GGML_TYPE_IQ3_S",
+diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
+index 2ac4ab2e9626..a9d6fe2a9d2d 100644
+--- a/ggml/src/ggml-cuda/vecdotq.cuh
++++ b/ggml/src/ggml-cuda/vecdotq.cuh
+@@ -118,6 +118,12 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
+ // 8 ints (32 bytes) per 32-element chunk, consumed by the regular q8_0 vec_dot (dp4a or mma).
+ #define VDR_TQ1_0_Q8_1_MMQ  8
+ 
++// TQ2_0: same shape as TQ1_0 (QK_K = 256 elements per block, 8 chunks of 32 elements).
++#define VDR_TQ2_0_Q8_1_MMVQ 1
++// MMQ expands the digits to signed bytes in the tile loader, so the tile row has the Q8_0 shape:
++// 8 ints (32 bytes) per 32-element chunk, consumed by the regular q8_0 vec_dot (dp4a or mma).
++#define VDR_TQ2_0_Q8_1_MMQ  8
++
+ #define VDR_Q4_0_Q8_1_MMVQ 2
+ #define VDR_Q4_0_Q8_1_MMQ  4
+ 
+@@ -907,6 +913,82 @@ static __device__ __forceinline__ float vec_dot_tq1_0_q8_1_nomul(
+     return d * d8 * sumi;
+ }
+ 
++// One 32-element chunk (iqs = 0..7) of a tq2_0 block against one block_q8_1 of activations.
++//
++// With e = 128*c + 32*l + m (see ggml_cuda_tq2_0_digit in common.cuh) the chunk iqs covers
++// c = iqs/4, l = iqs%4 and all 32 values of m, i.e. the 32 CONTIGUOUS bytes
++// qs[32*(iqs/4) .. 32*(iqs/4)+31] at one single bit-pair position. Eight 4-byte words, one shift,
++// one mask, one dp4a each: nothing is dequantized to float, the accumulator stays an integer for
++// the whole chunk and the two scales are multiplied once, at the end of the chunk.
++//
++// Weight words are read with get_int_b2, never get_int_b4: block_tq2_0 is 66 bytes, so odd
++// numbered blocks are only 2-byte aligned and a 4-byte load would fault (same reason as
++// block_tq1_0 at 54 bytes). block_q8_1 is 36 bytes with qs at offset 4, so the activation words
++// are 4-byte aligned and do use get_int_b4.
++static __device__ __forceinline__ float vec_dot_tq2_0_q8_1(
++    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
++
++    const block_tq2_0 * bq = (const block_tq2_0 *) vbq + kbx;
++
++    const block_q8_1 * bq8_1_chunk = bq8_1 + iqs;
++
++    const int shift = 2*(iqs & 3);   // bit pair position l of the whole chunk
++    const int woff  = 8*(iqs >> 2);  // get_int_b2 word index of the first of the 8 words
++
++    int sumi = 0;
++
++#pragma unroll
++    for (int j = 0; j < 8; ++j) {
++        const int s4 = ggml_cuda_tq2_0_symbols4(get_int_b2(bq->qs, woff + j), shift);
++        sumi = ggml_cuda_dp4a(s4, get_int_b4(bq8_1_chunk->qs, j), sumi);
++    }
++
++    const float d  = bq->d;
++    const float d8 = __low2float(bq8_1_chunk->ds);
++
++    return d * d8 * sumi;
++}
++
++// Strict variant, selected with -DGGML_CUDA_TQ2_0_NOMUL=ON: no integer multiply anywhere in the
++// dot product, not even dp4a. The weight of one element is digit - 1 = 2*b1 + b0 - 1 with
++// (b1, b0) the two stored bits, so its contribution is (b1 ? 2a : 0) + (b0 ? a : 0) - a: two
++// masked adds, one shift and one subtract per element. The trailing -a is what keeps digit 3
++// (weight +2) correct, so this is exact for all four levels too. Branchless on purpose - a
++// per-element if/else diverges the warp on every non-zero weight, which on a real model costs more
++// than the multiplies it saves.
++static __device__ __forceinline__ float vec_dot_tq2_0_q8_1_nomul(
++    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
++
++    const block_tq2_0 * bq = (const block_tq2_0 *) vbq + kbx;
++
++    const block_q8_1 * bq8_1_chunk = bq8_1 + iqs;
++
++    const int shift = 2*(iqs & 3);
++    const int woff  = 8*(iqs >> 2);
++
++    int sumi = 0;
++
++#pragma unroll
++    for (int j = 0; j < 8; ++j) {
++        const int w4 = get_int_b2(bq->qs, woff + j) >> shift;
++
++#pragma unroll
++        for (int t = 0; t < 4; ++t) {
++            const int dig = (w4 >> (8*t)) & 3;
++            const int a   = bq8_1_chunk->qs[4*j + t];
++            const int m1  = -(dig & 1);        // all ones where the low bit is set  -> +a
++            const int m2  = -((dig >> 1) & 1); // all ones where the high bit is set -> +2a
++
++            sumi += ((a & m2) << 1) + (a & m1) - a;
++        }
++    }
++
++    const float d  = bq->d;
++    const float d8 = __low2float(bq8_1_chunk->ds);
++
++    return d * d8 * sumi;
++}
++
+ static __device__ __forceinline__ float vec_dot_q4_0_q8_1(
+     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+ 
+
