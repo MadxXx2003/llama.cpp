@@ -20,6 +20,10 @@ jobs:
         id: patching
         shell: bash
         run: |
+          applied=0
+          already=0
+          failed=0
+          index=0
           set -uo pipefail
 
           mkdir -p patch-logs
