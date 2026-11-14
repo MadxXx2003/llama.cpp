@@ -53,7 +53,7 @@ diff --git a/ggml/src/ggml-cuda/CMakeLists.txt b/ggml/src/ggml-cuda/CMakeLists.t
 index 297d9ffc9d4a..069969e98bc7 100644
 --- a/ggml/src/ggml-cuda/CMakeLists.txt
 +++ b/ggml/src/ggml-cuda/CMakeLists.txt
-@@ -144,6 +144,10 @@ if (CUDAToolkit_FOUND)
+@@ -145,6 +145,10 @@ if (CUDAToolkit_FOUND)
          add_compile_definitions(GGML_CUDA_FORCE_CUBLAS)
      endif()
  
@@ -68,7 +68,7 @@ diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
 index a46c4d3f096f..82082c4e309d 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
-@@ -1007,6 +1007,117 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q2_0> {
+@@ -1079,6 +1079,117 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q2_0> {
      static constexpr int bs = sizeof(block_q2_0);
  };
  
@@ -199,7 +199,7 @@ index 77fd28894516..4d5b0596fb06 100644
          case GGML_TYPE_Q4_0:
              return dequantize_row_q4_0_cuda;
          case GGML_TYPE_Q4_1:
-@@ -556,6 +558,8 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
+@@ -558,6 +560,8 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
              return dequantize_block_cont_cuda<QK1_0, QR1_0, dequantize_q1_0>;
          case GGML_TYPE_Q2_0:
              return dequantize_block_cont_cuda<QK2_0, QR2_0, dequantize_q2_0>;
@@ -208,7 +208,7 @@ index 77fd28894516..4d5b0596fb06 100644
          case GGML_TYPE_Q4_0:
              return dequantize_row_q4_0_cuda;
          case GGML_TYPE_Q4_1:
-@@ -616,6 +620,8 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
+@@ -620,6 +624,8 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
              return dequantize_block_cont_cuda<QK1_0, QR1_0, dequantize_q1_0>;
          case GGML_TYPE_Q2_0:
              return dequantize_block_cont_cuda<QK2_0, QR2_0, dequantize_q2_0>;
@@ -217,7 +217,7 @@ index 77fd28894516..4d5b0596fb06 100644
          case GGML_TYPE_Q4_0:
              return dequantize_row_q4_0_cuda;
          case GGML_TYPE_Q4_1:
-@@ -675,6 +681,8 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
+@@ -681,6 +687,8 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
              return dequantize_block_cuda<QK1_0, QR1_0, dequantize_q1_0>;
          case GGML_TYPE_Q2_0:
              return dequantize_block_cuda<QK2_0, QR2_0, dequantize_q2_0>;
@@ -226,7 +226,7 @@ index 77fd28894516..4d5b0596fb06 100644
          case GGML_TYPE_Q4_0:
              return dequantize_block_cuda<QK4_0, QR4_0, dequantize_q4_0>;
          case GGML_TYPE_Q4_1:
-@@ -700,6 +708,8 @@ to_bf16_nc_cuda_t ggml_get_to_bf16_nc_cuda(ggml_type type) {
+@@ -708,6 +716,8 @@ to_bf16_nc_cuda_t ggml_get_to_bf16_nc_cuda(ggml_type type) {
              return dequantize_block_cuda<QK1_0, QR1_0, dequantize_q1_0>;
          case GGML_TYPE_Q2_0:
              return dequantize_block_cuda<QK2_0, QR2_0, dequantize_q2_0>;
@@ -235,7 +235,7 @@ index 77fd28894516..4d5b0596fb06 100644
          case GGML_TYPE_Q4_0:
              return dequantize_block_cuda<QK4_0, QR4_0, dequantize_q4_0>;
          case GGML_TYPE_Q4_1:
-@@ -725,6 +735,8 @@ to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type) {
+@@ -735,6 +745,8 @@ to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type) {
              return dequantize_block_cuda<QK1_0, QR1_0, dequantize_q1_0>;
          case GGML_TYPE_Q2_0:
              return dequantize_block_cuda<QK2_0, QR2_0, dequantize_q2_0>;
@@ -276,7 +276,7 @@ diff --git a/ggml/src/ggml-cuda/getrows.cu b/ggml/src/ggml-cuda/getrows.cu
 index d97e8fdb0f40..0de902a6ea66 100644
 --- a/ggml/src/ggml-cuda/getrows.cu
 +++ b/ggml/src/ggml-cuda/getrows.cu
-@@ -324,6 +324,10 @@ static void ggml_cuda_get_rows_switch_src0_type(
+@@ -328,6 +328,10 @@ static void ggml_cuda_get_rows_switch_src0_type(
              get_rows_cuda_q<QK2_0, QR2_0, dequantize_q2_0>(src0_d, src1_d, dst_d,
                  ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
              break;
@@ -291,7 +291,7 @@ diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
 index 06956ce7a3d9..db816bbd9a31 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -5841,6 +5841,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -6302,6 +6302,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                      case GGML_TYPE_F16:
                      case GGML_TYPE_Q1_0:
                      case GGML_TYPE_Q2_0:
@@ -299,7 +299,7 @@ index 06956ce7a3d9..db816bbd9a31 100644
                      case GGML_TYPE_Q4_0:
                      case GGML_TYPE_Q4_1:
                      case GGML_TYPE_Q5_0:
-@@ -5901,6 +5902,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -6364,6 +6365,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                          return true;
                      case GGML_TYPE_IQ4_NL:
                      case GGML_TYPE_MXFP4:
