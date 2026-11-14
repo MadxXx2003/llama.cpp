@@ -16,200 +16,117 @@ jobs:
           submodules: recursive
 
 
-      - name: Configure Git Identity & Apply Patches (Verbose Diagnostics)
+
+      - name: Apply Patches (GNU Patch + Fuzz)
         id: patching
         shell: bash
         run: |
+          set -uo pipefail
+      
+          mkdir -p patch-logs
+          REPORT="patch-report.md"
+      
+          total=0
           applied=0
           already=0
           failed=0
-          index=0
-          set -uo pipefail
-
-          mkdir -p patch-logs
-          REPORT="patch-report.md"
+      
           : > "$REPORT"
-
-          git config user.name "GitHub Action Runner"
-          git config user.email "runner@actions.local"
-
-          echo "=================================================="
-          echo "       VERBOSE PATCH APPLICATION SYSTEM"
-          echo "=================================================="
-
-          echo "Repository: $(git rev-parse --show-toplevel)"
-          echo "Branch:     $(git branch --show-current)"
-          echo "Commit:     $(git rev-parse HEAD)"
-          echo "Git:        $(git --version)"
-          echo ""
-
+      
           echo "## Patch Application Report" >> "$REPORT"
           echo "" >> "$REPORT"
-          echo "- Base commit: $(git rev-parse HEAD)" >> "$REPORT"
-          echo "- Branch: $(git branch --show-current)" >> "$REPORT"
-          echo "" >> "$REPORT"
-
-          echo "Initial working tree:"
-          git status --short
-
+      
+          echo "Git: $(git --version)"
+          echo "GNU patch: $(patch --version | head -n 1)"
+      
           shopt -s nullglob nocaseglob
           patches=(Patches/*.patch patch/*.patch)
           shopt -u nullglob nocaseglob
-
+      
           total=${#patches[@]}
-          applied=0
-          already=0
-          failed=0
-
-          echo ""
-          echo "Discovered $total patch file(s)."
-          echo ""
-
-          if [ "$total" -eq 0 ]; then
-            echo "No patch files found."
-            echo "No patches were available." >> "$REPORT"
-          fi
-
-          run_cmd() {
-            local description="$1"
-            shift
-
-            local tmp="${log}.attempt"
-
-            echo ""
-            echo ">>> $description"
-            printf 'COMMAND:'
-            printf ' %q' "$@"
-            echo ""
-
-            "$@" > "$tmp" 2>&1
-            local rc=$?
-
-            if [ -s "$tmp" ]; then
-              cat "$tmp" | tee -a "$log"
-            fi
-
-            rm -f "$tmp"
-
-            echo "Exit code: $rc"
-            echo "Exit code: $rc" >> "$log"
-
-            return "$rc"
-          }
-
+      
+          echo "Found $total patch(es)."
+      
           for p in "${patches[@]}"; do
-            index=$((index + 1))
-            index=${index:-1}
-
             filename=$(basename "$p")
-            log="patch-logs/$(printf '%03d' "$index")-${filename}.log"
-
+            log="patch-logs/${filename}.log"
+      
             : > "$log"
-
+      
             echo ""
-            echo "=================================================="
-            echo "PATCH [$index/$total]: $p"
-            echo "=================================================="
-
-            {
-              echo "# Patch: $p"
-              echo "Date: $(date -u)"
-              echo "Commit: $(git rev-parse HEAD)"
-            } >> "$log"
-
-            {
-              echo "### $p"
-            } >> "$REPORT"
-
-            echo ""
-            echo "[1/5] Inspecting patch..."
-
-            if ! run_cmd "Patch statistics" git apply --stat "$p"; then
-              echo "WARNING: Could not read patch statistics."
-            fi
-
-            run_cmd "Patch summary" git apply --summary "$p" || true
-
-            echo ""
-            echo "[2/5] Checking whether patch is already applied..."
-
-            if run_cmd "Reverse application check" git apply --reverse --check "$p"; then
-              echo "NOTICE: Patch already applied. Skipping."
+            echo "========================================"
+            echo "PATCH: $p"
+            echo "========================================"
+      
+            echo "### $p" >> "$REPORT"
+      
+            # Git is used only for informational statistics.
+            echo "[INFO] Patch statistics:"
+            git apply --stat "$p" 2>&1 || echo "Git statistics unavailable."
+      
+            # Check if already applied using GNU patch.
+            echo "[1/3] Checking if already applied..."
+      
+            if patch --dry-run --batch --reverse -p1 -i "$p" > "$log" 2>&1; then
+              echo "Already applied. Skipping."
               already=$((already + 1))
-              echo "- STATUS: ALREADY APPLIED" >> "$REPORT"
+              echo "- ALREADY APPLIED" >> "$REPORT"
               continue
             fi
-
-            echo ""
-            echo "[3/5] Attempting three-way application..."
-
-            if run_cmd "Three-way validation" git apply --check --3way "$p"; then
-
-              if run_cmd "Applying three-way patch" git apply --verbose --3way "$p"; then
-                echo "SUCCESS: Applied using three-way merge."
-                applied=$((applied + 1))
-                echo "- STATUS: APPLIED (3-way)" >> "$REPORT"
-                continue
-              else
-                echo "ERROR: Three-way application failed."
+      
+            # Try increasing fuzz levels.
+            success=0
+            selected_fuzz=0
+      
+            echo "[2/3] Testing with increasing fuzz..."
+      
+            for fuzz in 0 1 2 3 4; do
+              echo "Trying fuzz=$fuzz..."
+      
+              if patch --dry-run --batch --forward --fuzz="$fuzz" -p1 -i "$p" > "$log" 2>&1; then
+                success=1
+                selected_fuzz=$fuzz
+                echo "Dry-run successful (fuzz=$fuzz)."
+                break
               fi
-
-            else
-              echo "WARNING: Three-way validation failed."
-            fi
-
-            echo ""
-            echo "[4/5] Trying whitespace-tolerant application..."
-
-            if run_cmd "Whitespace-tolerant validation" git apply --check --ignore-space-change --ignore-whitespace "$p"; then
-
-              if run_cmd "Applying whitespace-tolerant patch" git apply --verbose --ignore-space-change --ignore-whitespace "$p"; then
-                echo "SUCCESS: Applied using whitespace tolerance."
+            done
+      
+            # Apply the patch using the successful fuzz level.
+            if [ "$success" -eq 1 ]; then
+              echo "[3/3] Applying..."
+      
+              if patch --batch --forward --fuzz="$selected_fuzz" -p1 -i "$p" >> "$log" 2>&1; then
+                echo "SUCCESS (fuzz=$selected_fuzz)"
                 applied=$((applied + 1))
-                echo "- STATUS: APPLIED (WHITESPACE FALLBACK)" >> "$REPORT"
-                continue
+                echo "- APPLIED (fuzz=$selected_fuzz)" >> "$REPORT"
               else
-                echo "ERROR: Whitespace-tolerant application failed."
+                echo "FAILED during application."
+                failed=$((failed + 1))
+                echo "- FAILED DURING APPLICATION" >> "$REPORT"
               fi
-
             else
-              echo "ERROR: Whitespace-tolerant validation failed."
+              echo "FAILED (fuzz 0-4 exhausted)."
+              failed=$((failed + 1))
+              echo "- FAILED (fuzz 0-4 exhausted)" >> "$REPORT"
             fi
-
-            echo ""
-            echo "[5/5] Collecting failure diagnostics..."
-
-            run_cmd "Normal patch validation" git apply --check --verbose "$p" || true
-
-            run_cmd "Current working tree" git status --short || true
-
-            run_cmd "Whitespace diagnostics" git diff --check || true
-
-            run_cmd "Patch file information" git apply --numstat "$p" || true
-
-            echo "FAILED: $p"
-            failed=$((failed + 1))
-
-            echo "- STATUS: FAILED" >> "$REPORT"
-            echo "- DIAGNOSTICS: $log" >> "$REPORT"
-
-            echo "WARNING: Continuing with remaining patches."
+      
+            echo "Log: $log"
           done
-
+      
           echo ""
-          echo "=================================================="
-          echo "             PATCH SUMMARY"
-          echo "=================================================="
-
-          echo "Total patches:   $total"
-          echo "Successfully applied: $applied"
-          echo "Already applied:      $already"
-          echo "Failed patches:       $failed"
-
+          echo "========================================"
+          echo "PATCH SUMMARY"
+          echo "========================================"
+      
+          echo "Total:   $total"
+          echo "Applied: $applied"
+          echo "Already: $already"
+          echo "Failed:  $failed"
+      
           echo ""
-          echo "Final working tree:"
-          git status --short
-
+          echo "Final Git status (diagnostics only):"
+          git status --short || true
+      
           {
             echo ""
             echo "## Summary"
@@ -220,9 +137,8 @@ jobs:
             echo "| Applied | $applied |"
             echo "| Already applied | $already |"
             echo "| Failed | $failed |"
-            echo ""
           } >> "$REPORT"
-
+      
           {
             echo "## Patch processing"
             echo ""
@@ -231,16 +147,15 @@ jobs:
             echo "- Already applied: $already"
             echo "- Failed: $failed"
           } >> "$GITHUB_STEP_SUMMARY"
-
-          echo ""
-          echo "Patch processing completed."
-          echo "Detailed logs: patch-logs/"
-          echo "Report: patch-report.md"
-
+      
           echo "PATCH_TOTAL=$total" >> "$GITHUB_OUTPUT"
           echo "PATCH_APPLIED=$applied" >> "$GITHUB_OUTPUT"
           echo "PATCH_ALREADY=$already" >> "$GITHUB_OUTPUT"
           echo "PATCH_FAILED=$failed" >> "$GITHUB_OUTPUT"
+      
+          echo ""
+          echo "Patch processing completed."
+
 
       - name: Install CUDA Toolkit
         uses: Jimver/cuda-toolkit@v0.2.16
