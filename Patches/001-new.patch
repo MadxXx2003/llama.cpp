@@ -574,13 +574,7 @@ diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
 index 1a9cf55cb915..ead188cac347 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -1,4 +1,5 @@
- #include "mmvq.cuh"
-+#include "mmvq-tq-pt.cuh"
- #include "quantize.cuh"
- #include "unary.cuh"
- #include "vecdotq.cuh"
-@@ -37,6 +38,11 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type)
+@@ -37,6 +37,11 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type)
      switch (type) {
          case GGML_TYPE_Q1_0:    return vec_dot_q1_0_q8_1;
          case GGML_TYPE_Q2_0:    return vec_dot_q2_0_q8_1;
@@ -592,7 +586,7 @@ index 1a9cf55cb915..ead188cac347 100644
          case GGML_TYPE_Q4_0:    return vec_dot_q4_0_q8_1;
          case GGML_TYPE_Q4_1:    return vec_dot_q4_1_q8_1;
          case GGML_TYPE_Q5_0:    return vec_dot_q5_0_q8_1;
-@@ -66,6 +72,7 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
+@@ -66,6 +71,7 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
      switch (type) {
          case GGML_TYPE_Q1_0:    return VDR_Q1_0_Q8_1_MMVQ;
          case GGML_TYPE_Q2_0:    return VDR_Q2_0_Q8_1_MMVQ;
@@ -600,7 +594,7 @@ index 1a9cf55cb915..ead188cac347 100644
          case GGML_TYPE_Q4_0:    return VDR_Q4_0_Q8_1_MMVQ;
          case GGML_TYPE_Q4_1:    return VDR_Q4_1_Q8_1_MMVQ;
          case GGML_TYPE_Q5_0:    return VDR_Q5_0_Q8_1_MMVQ;
-@@ -279,6 +286,13 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
+@@ -279,6 +285,13 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
  
  // Host function: returns the max batch size for the current arch+type at runtime.
  int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
@@ -614,7 +608,7 @@ index 1a9cf55cb915..ead188cac347 100644
      // NVIDIA: P100, Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
      if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
          cc = ggml_cuda_highest_compiled_arch(cc);
-@@ -1312,6 +1326,12 @@ static void mul_mat_vec_q_switch_type(
+@@ -1312,6 +1325,12 @@ static void mul_mat_vec_q_switch_type(
                   nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
                   nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
              break;
