@@ -67,7 +67,7 @@ diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
 index a46c4d3f096f..82082c4e309d 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
-@@ -1079,6 +1079,117 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q2_0> {
+@@ -1079,6 +1079,96 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q2_0> {
      static constexpr int bs = sizeof(block_q2_0);
  };
  
@@ -152,27 +152,6 @@ index a46c4d3f096f..82082c4e309d 100644
 +    return __vsub4(merged, 0x01010101);
 +#else
 +    return __vsub4(__byte_perm(dlo, dhi, 0x6240), 0x01010101);
-+#endif // defined(GGML_USE_HIP)
-+}
-+
-+// Raw ternary digits 0..2 (no -1 bias) of the four bytes of b4 at trit position n, one digit per
-+// byte. Identical SWAR chain to ggml_cuda_tq1_0_symbols4 minus the final __vsub4: the planar GEMV
-+// kernels (mmvq-tq-pt.cuh) keep the digits unsigned and subtract the exact integer sum of the
-+// activations once per 32 elements, which saves one ALU op per four weights and keeps every dp4a
-+// operand non-negative on the weight side.
-+static __device__ __forceinline__ int ggml_cuda_tq1_0_digits4(const int b4, const int p3n) {
-+    const int wlo = ((b4     ) & 0x00FF00FF) * p3n;   // 16-bit lanes: bytes 0 and 2 of b4
-+    const int whi = ((b4 >> 8) & 0x00FF00FF) * p3n;   // 16-bit lanes: bytes 1 and 3
-+
-+    const int dlo = (((wlo & 0x00FF00FF) * 3) >> 8) & 0x00FF00FF;   // digits of bytes 0, 2
-+    const int dhi = (((whi & 0x00FF00FF) * 3) >> 8) & 0x00FF00FF;   // digits of bytes 1, 3
-+
-+#if defined(GGML_USE_HIP)
-+    const int merged = (dlo & 0x000000FF) | ((dhi & 0x000000FF) << 8)
-+                     | (dlo & 0x00FF0000) | ((dhi & 0x00FF0000) << 8);
-+    return merged;
-+#else
-+    return __byte_perm(dlo, dhi, 0x6240);
 +#endif // defined(GGML_USE_HIP)
 +}
 +
@@ -648,148 +627,6 @@ index 1a9cf55cb915..ead188cac347 100644
          case GGML_TYPE_Q2_0:
              mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q2_0>
                  (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
-@@ -1547,11 +1567,30 @@ void ggml_cuda_mul_mat_vec_q(
- 
-     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-+
-+    // Ternary GEMV: planar-transposed activations (mmvq-tq-pt.cuh). The PT column is byte for byte
-+    // the same size as the AoS one, so the allocation below and every stride further down are shared.
-+    //
-+    // The activation layout is baked in right here, before quantization, so every host-side
-+    // invariant the PT launchers rely on has to be decided here as well. A shape the PT path does
-+    // not describe falls back to AoS instead of aborting at run time.
-+    const bool has_fusion_local = fusion_local.gate != nullptr || fusion_local.x_bias != nullptr ||
-+                                  fusion_local.gate_bias != nullptr || fusion_local.x_scale != nullptr ||
-+                                  fusion_local.gate_scale != nullptr || fusion_local.shared_up != nullptr;
-+    const int64_t pt_nchannels_dst = ids ? ne1 : ne2;
-+    const int64_t pt_ncols_dst     = ids ? ne2 : ne1;
-+    // MUL_MAT_ID walks the channel dimension through ids, so the ratio is only meaningful without ids.
-+    const bool pt_channels_ok = ids || (ne02 >= 1 && pt_nchannels_dst % ne02 == 0 && pt_nchannels_dst >= ne02);
-+    const bool pt_samples_ok  = ne03 >= 1 && ne3 % ne03 == 0 && ne3 >= ne03;
-+    const bool pt_slots_ok    = pt_ncols_dst >= 1 && pt_ncols_dst <= TQ_PT_MAX_SLOTS;
-+    const bool use_tq_pt = pt_channels_ok && pt_samples_ok && pt_slots_ok && mul_mat_vec_tq_pt_supported(
-+        src0->type, ne00, has_fusion_local, ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size);
-+
-     {
-         const int64_t s11 = src1->nb[1] / ts_src1;
-         const int64_t s12 = src1->nb[2] / ts_src1;
-         const int64_t s13 = src1->nb[3] / ts_src1;
-         quantize_row_q8_1_cuda(src1_d, src1_q8_1.get(), ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
-     }
- 
-     const int64_t s01 = src0->nb[1] / ts_src0;
-@@ -1576,6 +1615,16 @@ void ggml_cuda_mul_mat_vec_q(
- 
-     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
- 
-+    if (use_tq_pt) {
-+        mul_mat_vec_tq_pt(
-+            src0->data, src0->type, src1_q8_1.get(), ids_d, dst_d, ne00,
-+            ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
-+            ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
-+            ne03,              ne3,           s03, s13,              s3,               ids_stride,
-+            (int) (ne10_padded / TQ_PT_QK), stream);
-+        return;
-+    }
-+
-     mul_mat_vec_q_switch_type(
-         src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
-         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
-diff --git a/ggml/src/ggml-cuda/quantize.cu b/ggml/src/ggml-cuda/quantize.cu
-index ea089a8c6249..8dcd98b710e3 100644
---- a/ggml/src/ggml-cuda/quantize.cu
-+++ b/ggml/src/ggml-cuda/quantize.cu
-@@ -1,4 +1,6 @@
- #include "quantize.cuh"
-+#include "mmvq-tq-pt.cuh"
-+
- #include <cstdint>
- 
- #if defined(BLACKWELL_MMA_AVAILABLE)
-@@ -571,6 +573,82 @@ void quantize_row_q8_1_cuda(
-     ggml_cuda_kernel_launch(quantize_q8_1, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
- }
- 
-+// Planar-transposed q8_1 writer, see mmvq-tq-pt.cuh for the layout. Same grid, same one thread
-+// per element and the same 32-lane reductions as quantize_q8_1, so a column quantized here holds
-+// exactly the same quants and scales as the AoS version - only the byte order differs, plus the
-+// second half of ds, which stores the exact integer sum of the 32 quants instead of the float sum
-+// of the inputs (the PT dot needs the integer to undo the missing -1 bias). Packed by
-+// tq_pt_pack_ds in mmvq-tq-pt.cuh.
-+__launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
-+static __global__ void quantize_q8_1_pt(
-+        const float * x_ptr, void * vy_ptr,
-+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
-+        const int64_t ne0, const uint32_t ne1, const uint3 ne2) {
-+    ggml_cuda_pdl_lc();
-+    const float * GGML_CUDA_RESTRICT x  = x_ptr;
-+    char        * GGML_CUDA_RESTRICT vy = (char *) vy_ptr;
-+    const int64_t i0 = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
-+
-+    if (i0 >= ne0) {
-+        return;
-+    }
-+
-+    const int64_t i3 = fastdiv(blockIdx.z, ne2);
-+    const int64_t i2 = blockIdx.z - i3*ne2.z;
-+    const int64_t i1 = blockIdx.y;
-+
-+    // element index inside the padded activation tensor, identical to quantize_q8_1
-+    const int64_t i_cont = ((i3*ne2.z + i2) * ne1 + i1) * ne0 + i0;
-+
-+    ggml_cuda_pdl_sync();
-+    const float xi = i0 < ne00 ? x[i3*s03 + i2*s02 + i1*s01 + i0] : 0.0f;
-+    float amax = fabsf(xi);
-+
-+    amax = warp_reduce_max<QK8_1>(amax);
-+
-+    const float  d = amax / 127.0f;
-+    const int8_t q = amax == 0.0f ? 0 : (int8_t) roundf(xi / d);
-+
-+    // Exact integer sum of the 32 quants of this sub-block. A float accumulator is exact here
-+    // (|sum| <= 32*127) and the reduction must happen BEFORE the early return below: all 32 lanes
-+    // of the warp have to reach the shuffle.
-+    const float sumq = warp_reduce_sum<QK8_1>((float) q);
-+
-+    const int64_t col  = i_cont / ne0;
-+    const int64_t e    = i_cont % ne0;
-+    const int64_t nblk = ne0 / TQ_PT_QK;
-+    const int64_t kb   = e / TQ_PT_QK;
-+    const int64_t er   = e % TQ_PT_QK;
-+
-+    int8_t * ycol = (int8_t *) vy + col*tq_pt_col_bytes(ne0);
-+
-+    ycol[((er/16)*nblk + kb)*16 + er%16] = q;
-+
-+    if (er % QK8_1 != 0) {
-+        return;
-+    }
-+
-+    half2 * ds = (half2 *) (ycol + (size_t) nblk*TQ_PT_PLANES*16 + (size_t) kb*TQ_PT_SUB*4);
-+    ds[er/QK8_1] = tq_pt_pack_ds(d, (int) sumq);
-+}
-+
-+void quantize_row_q8_1_pt_cuda(
-+        const float * x, void * vy, const ggml_type type_src0,
-+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
-+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
-+    GGML_ASSERT(ne0 % TQ_PT_QK == 0);
-+    GGML_ASSERT(ne00 <= ne0);
-+
-+    const uint3 ne2_fastdiv = init_fastdiv_values(ne2);
-+
-+    const int64_t block_num_x = (ne0 + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE;
-+    const dim3 num_blocks(block_num_x, ne1, ne2*ne3);
-+    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
-+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
-+    ggml_cuda_kernel_launch(quantize_q8_1_pt, launch_params, x, vy, ne00, s01, s02, s03, ne0, (uint32_t) ne1, ne2_fastdiv);
-+    GGML_UNUSED(type_src0);
-+}
-+
- void quantize_mmq_q8_1_cuda(
-         const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
-         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
 diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
 index d5ff93b91241..2ac4ab2e9626 100644
 --- a/ggml/src/ggml-cuda/vecdotq.cuh
