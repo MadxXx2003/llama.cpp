@@ -325,7 +325,7 @@ diff --git a/ggml/src/ggml-cuda/mmq-load-tiles.cuh b/ggml/src/ggml-cuda/mmq-load
 index 226579fccfa8..39aebd9dbe45 100644
 --- a/ggml/src/ggml-cuda/mmq-load-tiles.cuh
 +++ b/ggml/src/ggml-cuda/mmq-load-tiles.cuh
-@@ -2138,3 +2138,102 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1940,3 +1940,102 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
  #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
      }
  }
@@ -588,7 +588,7 @@ index 2ac4ab2e9626..a9d6fe2a9d2d 100644
  #define VDR_Q4_0_Q8_1_MMVQ 2
  #define VDR_Q4_0_Q8_1_MMQ  4
  
-@@ -907,6 +913,82 @@ static __device__ __forceinline__ float vec_dot_tq1_0_q8_1_nomul(
+@@ -921,6 +927,82 @@ static __device__ __forceinline__ float vec_dot_tq1_0_q8_1_nomul(
      return d * d8 * sumi;
  }
  
